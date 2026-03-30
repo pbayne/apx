@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/common", "crates/agent", "crates/studio", "crates/core", "crates/mcp", "crates/cli", "crates/databricks_sdk", "crates/apx", "crates/db"]
+members = ["crates/common", "crates/agent", "crates/studio", "crates/core", "crates/mcp", "crates/cli", "crates/databricks_sdk", "crates/apx", "crates/db", "crates/framework"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.7"
+version = "0.3.8"
 edition = "2024"
 rust-version = "1.92"
 description = "APX application framework"
@@ -22,6 +22,7 @@ apx-mcp = { path = "crates/mcp" }
 apx-cli = { path = "crates/cli" }
 apx-databricks-sdk = { path = "crates/databricks_sdk" }
 apx-db = { path = "crates/db" }
+apx-framework = { path = "crates/framework" }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -32,29 +33,35 @@ toml_edit = "0.24.0"
 
 # Database
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 
 # Async runtime
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "signal", "io-std", "net"] }
 tokio-stream = "0.1.17"
+futures-core = "0.3.31"
 futures-util = "0.3.31"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
 rmcp = { version = "0.15", features = ["server", "transport-io", "schemars"] }
 
 # Web server
 axum = { version = "0.8.8", features = ["ws"] }
-reqwest = { version = "0.13.1", default-features = false, features = ["json", "stream", "rustls", "http2", "charset", "system-proxy"] }
+reqwest = { version = "0.13.1", default-features = false, features = ["json", "stream", "rustls", "http2", "charset", "system-proxy", "multipart"] }
 tokio-tungstenite = { version = "0.28", features = ["connect", "rustls-tls-native-roots"] }
+hyper-tungstenite = "0.19"
 
 # OpenTelemetry
 opentelemetry = "0.29"
-opentelemetry_sdk = { version = "0.29", features = ["rt-tokio", "logs"] }
-opentelemetry-otlp = { version = "0.29", features = ["http-json", "logs"] }
-opentelemetry-appender-tracing = "0.29"
+opentelemetry_sdk = { version = "0.29", features = ["rt-tokio", "logs", "trace", "metrics", "spec_unstable_metrics_views"] }
+opentelemetry-otlp = { version = "0.29", features = ["grpc-tonic", "logs", "trace", "metrics"] }
+opentelemetry-appender-tracing = { version = "0.29", features = ["experimental_use_tracing_span_context"] }
 opentelemetry-proto = "0.31.0"
 prost = "0.14.3"
 
 # Logging/tracing
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-opentelemetry = "0.30"
 thiserror = "2.0"
 
 # CLI
@@ -112,8 +119,31 @@ wiremock = "0.6"
 # Embedded resources
 which = "7"
 
+# Python embedding (framework)
+# IMPORTANT: No "auto-initialize" feature. Without it, accidental PyO3 use in
+# the supervisor path panics with "Python is not initialized" — a loud failure
+# instead of silent interpreter corruption in the multi-worker fork model.
+# NOTE: "extension-module" is NOT set here — it is set only in crates/apx
+# (the cdylib). Library crates need to link against libpython for `cargo test`.
+pyo3 = { version = "0.28.2", features = ["macros"] }
+pyo3-async-runtimes = { version = "0.28.0", features = ["tokio-runtime"] }
+socket2 = "0.6.2"
+
+# Framework: admission control + HTTP middleware
+tower = { version = "0.5", features = ["timeout", "limit"] }
+tower-http = { version = "0.6", features = ["trace", "normalize-path", "request-id"] }
+
+# Framework: IPC serialization (msgpack)
+rmp-serde = "1"
+
+# Framework: explicit deps used directly in types (not via transitive re-export from axum)
+form_urlencoded = "1"
+http = "1"
+bytes = "1"
+http-body-util = "0.1"
+
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 warnings = "deny"
 
 # Correctness

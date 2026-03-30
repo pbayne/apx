@@ -16,6 +16,7 @@ pub(crate) mod frontend;
 pub(crate) mod info;
 /// Project initialization wizard and template rendering.
 pub mod init;
+pub(crate) mod serve;
 pub(crate) mod skill;
 pub(crate) mod upgrade;
 
@@ -58,6 +59,8 @@ enum Commands {
     /// 🧠 Skill commands (Claude Code integration)
     #[command(subcommand)]
     Skill(SkillCommands),
+    /// 🏗️  Serve the app with the apx framework runtime
+    Serve(serve::ServeArgs),
     /// 💬 Send feedback to the apx team
     Feedback(feedback::FeedbackArgs),
     /// ℹ️  Show environment and version info
@@ -122,14 +125,29 @@ enum FluxCommands {
 /// Used when the top-level Ctrl+C handler cancels the running command.
 const EXIT_CODE_SIGINT: i32 = 130;
 
+/// Build the Tokio runtime for this process.
+///
+/// Worker processes (detected via `APX_WORKER_NONCE`) use a single-threaded
+/// runtime — all I/O and Python execution share one thread, matching the
+/// uvicorn model. Supervisor and CLI commands use the multi-threaded runtime.
+fn build_runtime() -> Result<tokio::runtime::Runtime, std::io::Error> {
+    let is_worker = std::env::var_os("APX_WORKER_NONCE").is_some();
+    if is_worker {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    }
+}
+
 /// Parse CLI arguments and execute the corresponding subcommand.
 ///
 /// Returns an exit code (0 for success, non-zero for failure).
 pub fn run_cli(args: Vec<String>) -> i32 {
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    let runtime = match build_runtime() {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("Failed to create tokio runtime: {err}");
@@ -141,6 +159,8 @@ pub fn run_cli(args: Vec<String>) -> i32 {
 }
 
 async fn run_cli_async(args: Vec<String>) -> i32 {
+    apx_core::tracing_init::init_tracing();
+
     // Handle Ctrl+C at the top level instead of in a spawned background task.
     //
     // `tokio::signal::ctrl_c()` permanently replaces the OS default SIGINT handler,
@@ -209,6 +229,7 @@ async fn run_command(args: Vec<String>) -> i32 {
         Some(Commands::Skill(skill_cmd)) => match skill_cmd {
             SkillCommands::Install(args) => skill::install::run(args).await,
         },
+        Some(Commands::Serve(args)) => serve::run(args).await,
         Some(Commands::Feedback(args)) => feedback::run(args).await,
         Some(Commands::Info(args)) => info::run(args).await,
         Some(Commands::Upgrade) => upgrade::run().await,

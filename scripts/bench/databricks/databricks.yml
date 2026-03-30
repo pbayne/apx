@@ -1,0 +1,144 @@
+bundle:
+  name: apx-bench
+
+sync:
+  include:
+    - .build
+
+resources:
+  apps:
+    # Tuning rationale (2 CPU / 6 GB):
+    #   --workers 2: equalized across all servers for fair comparison.
+    #   --loop uvloop / --http httptools: C-level loop + parser, 2-4x over pure-Python.
+    #     https://github.com/MagicStack/uvloop
+    #   --backlog 2048: larger TCP listen queue absorbs burst traffic under load.
+    bench_uvicorn:
+      name: "bench-uvicorn"
+      description: "Benchmark: uvicorn + uvloop + httptools"
+      source_code_path: ./.build/bench-uvicorn
+      config:
+        command:
+          - "uvicorn"
+          - "app.main:app"
+          - "--host"
+          - "0.0.0.0"
+          - "--workers"
+          - "2"
+          - "--loop"
+          - "uvloop"
+          - "--http"
+          - "httptools"
+          - "--backlog"
+          - "2048"
+        env:
+          - name: APX_BENCH_SERVER
+            value: uvicorn
+          - name: APX_BENCH_PROFILE
+            value: "1"
+
+    # Tuning rationale (2 CPU / 6 GB):
+    #   --workers 2: maintainer recommends 1 worker per CPU for granian's Tokio-backed
+    #     architecture. https://github.com/emmett-framework/granian/discussions/278
+    #   --loop uvloop: rloop (Rust loop) is NOT production-ready (no TLS).
+    #   --runtime-mode mt: multi-threaded mode may suit the Databricks container scheduler
+    #     better than st. Testing per bench report recommendation.
+    #   --backpressure 256: doubled from 128 to test whether higher backpressure
+    #     reduces latency spikes under load.
+    #   --no-ws: disables unused WebSocket support to reduce overhead.
+    bench_granian:
+      name: "bench-granian"
+      description: "Benchmark: granian + ASGI + uvloop"
+      source_code_path: ./.build/bench-granian
+      config:
+        command:
+          - "granian"
+          - "--interface"
+          - "asgi"
+          - "--loop"
+          - "uvloop"
+          - "app.main:app"
+          - "--host"
+          - "0.0.0.0"
+          - "--workers"
+          - "2"
+          - "--runtime-mode"
+          - "mt"
+          - "--backpressure"
+          - "256"
+          - "--backlog"
+          - "1024"
+          - "--no-ws"
+        env:
+          - name: APX_BENCH_SERVER
+            value: granian
+          - name: APX_BENCH_PROFILE
+            value: "1"
+
+    # # Tuning rationale (2 CPU / 6 GB):
+    # #   --workers 2: APX uses a multi-process model where each worker runs a
+    # #     single-threaded Tokio runtime + dormant asyncio loop driven by a Rust
+    # #     scheduler. Architecturally similar to granian (Rust-backed), so the optimal
+    # #     count is 1 worker per CPU core — not cores+1, because the Rust scheduler
+    # #     minimises GIL-held time and an extra worker would just cause contention.
+    # #   TOKIO_WORKER_THREADS removed: workers use new_current_thread() Tokio runtime,
+    # #     so this env var had no effect on per-worker performance.
+    # bench_apx:
+    #   name: "bench-apx"
+    #   description: "Benchmark: APX + asyncio"
+    #   source_code_path: ./.build/bench-apx
+    #   telemetry_export_destinations:
+    #     - unity_catalog:
+    #         logs_table: "apx_perf.default.otel_logs"
+    #         metrics_table: "apx_perf.default.otel_metrics"
+    #         traces_table: "apx_perf.default.otel_spans"
+    #   config:
+    #     command:
+    #       - "apx"
+    #       - "serve"
+    #       - "app.main"
+    #       - "--host"
+    #       - "0.0.0.0"
+    #       - "--workers"
+    #       - "2"
+    #     env:
+    #       - name: APX_BENCH_SERVER
+    #         value: apx
+    #       - name: APX_BENCH_PROFILE
+    #         value: "1"
+    #       - name: APX_PERF
+    #         value: "1"
+    #       - name: APX_LOG
+    #         value: "trace"
+    #       - name: OTEL_TRACES_SAMPLER
+    #         value: "always_on"
+
+    bench_bencher:
+      name: "bench-bencher"
+      description: "Benchmark orchestrator: runs oha, stores results"
+      source_code_path: ./.build/bench-bencher
+      config:
+        command:
+          - "uvicorn"
+          - "bencher.app:app"
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "8000"
+          - "--workers"
+          - "1"
+        env:
+          - name: APX_BENCH_SERVER
+            value: bencher
+          - name: BENCH_PG_PROJECT_ID
+            value: "bench-pg"
+
+  postgres_projects:
+    bench_pg:
+      project_id: 'bench-pg'
+      display_name: 'Bencher PostgreSQL'
+      pg_version: 17
+
+targets:
+  dev:
+    mode: development
+    default: true

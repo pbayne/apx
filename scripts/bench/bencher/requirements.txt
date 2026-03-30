@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+httpx
+databricks-sdk>=0.100.0
+psycopg[binary]

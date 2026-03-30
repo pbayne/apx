@@ -1,0 +1,64 @@
+[package]
+name = "apx-framework"
+version = "0.3.8"
+edition.workspace = true
+rust-version.workspace = true
+description = "Python framework embedding via PyO3 for apx"
+repository.workspace = true
+license.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+mimalloc = { version = "0.1", optional = true, default-features = false }
+pyo3.workspace = true
+pyo3-async-runtimes.workspace = true
+tokio.workspace = true
+socket2.workspace = true
+apx-common.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+hex.workspace = true
+apx-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+rmp-serde.workspace = true
+tempfile.workspace = true
+http.workspace = true
+bytes.workspace = true
+http-body = "1"
+http-body-util.workspace = true
+sysinfo.workspace = true
+which.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+crossbeam-channel.workspace = true
+crossbeam-queue.workspace = true
+tokio-stream.workspace = true
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+hyper-tungstenite = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber = { workspace = true }

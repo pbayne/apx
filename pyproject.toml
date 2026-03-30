@@ -5,7 +5,7 @@ description = "apx is the toolkit for building Databricks Apps"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [{ name = "renardeinside", email = "polarpersonal@gmail.com" }]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["pydantic>=2.0", "uvloop>=0.21.0; sys_platform != 'win32'"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -15,11 +15,17 @@ classifiers = [
     "Framework :: Hatch",
 ]
 
+[project.scripts]
+apx = "apx:_main"
+
 [dependency-groups]
 dev = [
     "beautifulsoup4>=4.14.3",
-    "databricks-sdk>=0.74.0",
+    "databricks-sdk>=0.102.0",
+    "diskcache>=5.6.3",
+    "docker>=7.1.0",
     "docutils>=0.22.4",
+    "grpcio>=1.68.0",
     "fastapi>=0.119.0",
     "httpx>=0.28.1",
     "jinja2>=3.1.6",
@@ -27,6 +33,7 @@ dev = [
     "msgpack>=1.1.2",
     "msgpack-types>=0.7.0",
     "mypy>=1.18.2",
+    "opentelemetry-proto>=1.29.0",
     "psycopg[binary,pool]>=3.3.2",
     "pydantic-settings>=2.11.0",
     "pytest>=8.4.2",
@@ -53,20 +60,27 @@ dev = [
     "types-requests>=2.32.4.20250913",
     "types-tqdm>=4.67.0.20250809",
     "types-ujson>=5.10.0.20250822",
+    "uvloop>=0.22.1",
+    "websockets>=16.0",
 ]
 
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: integration tests requiring Docker",
+]
 
 [tool.mypy]
 exclude = ['venv', '.venv', 'src/apx/templates', 'node_modules', 'experiments']
 
 
 [tool.maturin]
-bindings = "bin"
+bindings = "pyo3"
+module-name = "apx._core"
 manifest-path = "crates/apx/Cargo.toml"
 python-packages = ["apx"]
 python-source = "src"
 strip = true
-include = ["**/apx/binaries/*"]
 
 [tool.uv]
 cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.rs" }, { file = "Cargo.toml" }, { file = "Cargo.lock" }]
