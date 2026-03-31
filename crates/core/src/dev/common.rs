@@ -23,6 +23,15 @@ use crate::common::ensure_dir;
 /// to avoid a race where both timeouts fire simultaneously, causing every poll cycle to fail.
 const PROBE_TIMEOUT_SECS: u64 = 1;
 
+/// Health probe path for the backend.
+///
+/// The framework serves `/healthz` as a static short-circuit response in
+/// `ApxService`, so probing this path avoids polluting application logs.
+pub(crate) const BACKEND_PROBE_PATH: &str = "/healthz";
+
+/// Health probe path for the frontend (Vite has no dedicated health endpoint).
+pub(crate) const FRONTEND_PROBE_PATH: &str = "/";
+
 /// Shared HTTP client for health probes.
 /// Reused across all health checks to avoid creating a new client per probe.
 pub(crate) static HEALTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -45,11 +54,11 @@ pub(crate) enum ProbeResult {
     Failed,
 }
 
-/// Probe a service by making an HTTP GET request to its root path.
+/// Probe a service by making an HTTP GET request to the given `path`.
 /// Any HTTP response (regardless of status code) means the server is up.
 /// Only connection/timeout failures indicate the server isn't ready yet.
-pub(crate) async fn http_health_probe(host: &str, port: u16) -> ProbeResult {
-    let url = format!("http://{host}:{port}/");
+pub(crate) async fn http_health_probe(host: &str, port: u16, path: &str) -> ProbeResult {
+    let url = format!("http://{host}:{port}{path}");
     let start = std::time::Instant::now();
     match HEALTH_CLIENT.get(&url).send().await {
         Ok(resp) => {
@@ -57,14 +66,16 @@ pub(crate) async fn http_health_probe(host: &str, port: u16) -> ProbeResult {
             let elapsed_ms = start.elapsed().as_millis();
             if status == 200 {
                 debug!(url = %url, status, elapsed_ms, "Health probe OK");
+            } else if status >= 400 {
+                warn!(url = %url, status, elapsed_ms, "Health probe returned {status}");
             } else {
-                warn!(url = %url, status, elapsed_ms, "Health probe returned non-200");
+                debug!(url = %url, status, elapsed_ms, "Health probe returned {status}");
             }
             ProbeResult::Responded
         }
         Err(err) => {
             let elapsed_ms = start.elapsed().as_millis();
-            debug!(url = %url, error = %err, elapsed_ms, "Health probe failed");
+            debug!(url = %url, error = %err, elapsed_ms, "Health probe failed with error: {err}");
             ProbeResult::Failed
         }
     }
@@ -76,6 +87,81 @@ pub(crate) async fn http_health_probe(host: &str, port: u16) -> ProbeResult {
 pub enum Shutdown {
     /// Stop the entire dev server
     Stop,
+}
+
+/// Status of an individual managed dev subprocess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcessStatus {
+    /// Service responded to health probe.
+    Healthy,
+    /// Process is running but not yet responding.
+    Starting,
+    /// Process is not running (never started or exited cleanly).
+    Stopped,
+    /// Process exited unexpectedly and cannot recover.
+    Failed,
+    /// Could not determine process state.
+    Error,
+    /// Status check itself returned an unexpected result.
+    Unknown,
+    /// Process was not started because the project does not require it (e.g. no UI).
+    Skipped,
+}
+
+impl ProcessStatus {
+    /// Whether this process is considered ready for aggregate health.
+    pub fn is_ready(self) -> bool {
+        matches!(self, Self::Healthy | Self::Skipped)
+    }
+
+    /// Whether this process has permanently failed.
+    pub fn is_failed(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Starting => "starting",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Error => "error",
+            Self::Unknown => "unknown",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+impl std::fmt::Display for ProcessStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Aggregate health of the dev server (derived from individual process statuses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerHealth {
+    /// All critical services are healthy.
+    Ok,
+    /// One or more critical services are not yet ready.
+    Starting,
+}
+
+impl ServerHealth {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Starting => "starting",
+        }
+    }
+}
+
+impl std::fmt::Display for ServerHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Directory name for the dev lock file.
@@ -206,8 +292,8 @@ pub(crate) trait DevProcess: Send + Sync {
     /// Human-readable label for log messages ("backend", "db").
     fn label(&self) -> &'static str;
 
-    /// Report current process status as a static label.
-    async fn status(&self) -> &'static str;
+    /// Report current process status.
+    async fn status(&self) -> ProcessStatus;
 }
 
 /// Kill a child process tree immediately (used for restart operations).

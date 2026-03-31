@@ -8,7 +8,7 @@ use super::ipc::channel::WorkerChannel;
 use super::ipc::protocol::{BootstrapError, IpcMessage, Nonce, WorkerBootstrap};
 use super::signal::shutdown_signal;
 use super::worker_context::WorkerContext;
-use crate::asgi::app::{AppSource, ModuleImport};
+use crate::asgi::app::{AppSource, ModuleImport, format_pyerr};
 use crate::io::EventLoop;
 use crate::protocol::http::service::{ApxService, ServiceConfig, serve_tcp};
 use crate::transport::{Listener, TransportConfig, TransportError};
@@ -16,9 +16,6 @@ use pyo3::prelude::*;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Minimum drain timeout (seconds) even if request_timeout_secs is lower.
-const MIN_DRAIN_TIMEOUT_SECS: u64 = 5;
 
 /// Errors during worker operation.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +39,18 @@ pub enum WorkerError {
     /// Serving requests failed.
     #[error("serve failed: {0}")]
     Serve(std::io::Error),
+}
+
+/// Format a worker error with full Python traceback when available.
+///
+/// Pattern-matches through the error chain to find a `PyErr` inside
+/// `AppLoadError::ImportFailed` and renders its traceback. Falls back to
+/// the standard `Display` chain for non-Python errors.
+pub fn format_worker_error(err: &WorkerError) -> String {
+    if let WorkerError::AppLoad(crate::asgi::app::AppLoadError::ImportFailed { source, .. }) = err {
+        return Python::attach(|py| format_pyerr(py, source));
+    }
+    err.to_string()
 }
 
 /// Phase 1 runtime: TCP listener + Python interpreter (expensive, survives reloads).
@@ -105,25 +114,26 @@ async fn signal_readiness(channel: &mut WorkerChannel) -> Result<(), WorkerError
         .map_err(WorkerError::from)
 }
 
-/// Convenience: connect → init → signal readiness → load app → serve.
-///
-/// # Errors
-///
-/// Returns an error at any step in the worker lifecycle.
-pub async fn run_worker(
-    channel: WorkerChannel,
-    bootstrap: WorkerBootstrap,
-) -> Result<(), WorkerError> {
-    let mut runtime = init_worker(&bootstrap, channel).await?;
-    signal_readiness(&mut runtime.channel).await?;
+/// Loaded app and telemetry config, ready for readiness signal.
+struct AppReady {
+    dispatch: Arc<dyn crate::dispatch::Dispatch>,
+    telemetry: crate::telemetry::config::TelemetryConfig,
+}
 
-    // Create the 3-thread dispatch pipeline (no GIL needed).
+crate::opaque_debug!(AppReady);
+
+/// Load the Python app and read telemetry configuration.
+///
+/// Covers every fallible step between `init_worker` and `signal_readiness`.
+/// On failure the caller sends `StartupFailed` over IPC before exiting.
+fn load_app(runtime: &WorkerRuntime, bootstrap: &WorkerBootstrap) -> Result<AppReady, WorkerError> {
+    apply_python_log_config()?;
+
     let pipeline = Arc::new(
         crate::io::channel::DispatchPipeline::new()
             .map_err(|e| WorkerError::PythonInit(format!("dispatch pipeline: {e}")))?,
     );
 
-    // Build WorkerContext with pipeline + WS legacy fields.
     let ctx = {
         let el = &runtime.event_loop;
         Python::attach(|py| -> Result<Arc<WorkerContext>, WorkerError> {
@@ -137,63 +147,78 @@ pub async fn run_worker(
         })?
     };
 
-    // Load app, install Python dispatch, build Rust dispatch.
     let server_addr = runtime.listener.local_addr();
     let event_loop_py = runtime.event_loop.event_loop_py();
     let dispatch = Python::attach(|py| {
-        ModuleImport::new(bootstrap.app_module.as_str()).build(py, ctx, event_loop_py, server_addr)
+        ModuleImport::new(bootstrap.app_module.as_str(), bootstrap.dev_mode).build(
+            py,
+            ctx,
+            event_loop_py,
+            server_addr,
+        )
     })?;
 
-    // Read telemetry config from Python (after app load, so user configure() ran).
-    let telemetry_config = Python::attach(|py| {
+    let telemetry = Python::attach(|py| {
         crate::telemetry::bootstrap_python_telemetry(py)
             .map_err(|e| WorkerError::PythonInit(format!("telemetry bootstrap: {e}")))?;
         crate::telemetry::config::read_python_config(py)
             .map_err(|e| WorkerError::PythonInit(format!("telemetry config: {e}")))
     })?;
 
-    // Relay system + process config to supervisor (worker 0 only).
-    if bootstrap.relay_telemetry {
-        let relay = super::ipc::protocol::TelemetryRelay {
-            system: telemetry_config.system,
-            process: telemetry_config.process,
-        };
-        runtime
-            .channel
-            .send(&IpcMessage::TelemetryConfig(relay))
-            .await
-            .map_err(WorkerError::from)?;
-        tracing::debug!(
-            name: "apx.worker.telemetry_relayed",
-            target: "apx::telemetry",
-            "relayed telemetry config to supervisor"
-        );
+    Ok(AppReady {
+        dispatch,
+        telemetry,
+    })
+}
+
+/// Relay telemetry config to the supervisor (worker 0 only).
+async fn relay_telemetry(
+    channel: &mut WorkerChannel,
+    bootstrap: &WorkerBootstrap,
+    telemetry: &crate::telemetry::config::TelemetryConfig,
+) -> Result<(), WorkerError> {
+    if !bootstrap.relay_telemetry {
+        return Ok(());
     }
-
-    // Initialize per-worker metric toggles from Python config.
-    crate::telemetry::http::init(telemetry_config.http.metrics);
-    crate::telemetry::dispatch_metrics::init(telemetry_config.apx.metrics);
-
-    let _process_metrics_handle = if telemetry_config.process.enabled {
-        Some(crate::telemetry::process_metrics::spawn_process_metrics(
-            &telemetry_config.process,
-        ))
-    } else {
-        None
+    let relay = super::ipc::protocol::TelemetryRelay {
+        system: telemetry.system,
+        process: telemetry.process,
     };
+    channel
+        .send(&IpcMessage::TelemetryConfig(relay))
+        .await
+        .map_err(WorkerError::from)?;
+    tracing::debug!(
+        name: "apx.worker.telemetry_relayed",
+        target: "apx::telemetry",
+        "relayed telemetry config to supervisor"
+    );
+    Ok(())
+}
 
-    tracing::info!(
+/// Initialize per-worker metric toggles and spawn collectors.
+fn init_metrics(telemetry: &crate::telemetry::config::TelemetryConfig) {
+    crate::telemetry::http::init(telemetry.http.metrics);
+    crate::telemetry::dispatch_metrics::init(telemetry.apx.metrics);
+
+    tracing::debug!(
         name: "apx.worker.telemetry_bootstrap_complete",
         target: "apx::telemetry",
-        process_metrics = telemetry_config.process.enabled,
-        http_instrumentation = telemetry_config.http.enabled,
-        apx_dispatch_metrics = telemetry_config.apx.enabled,
+        process_metrics = telemetry.process.enabled,
+        http_instrumentation = telemetry.http.enabled,
+        apx_dispatch_metrics = telemetry.apx.enabled,
         otel_endpoint = %std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default(),
         meter_provider = apx_core::tracing_init::meter_provider().is_some(),
         "telemetry bootstrap complete"
     );
+}
 
-    // Build HTTP service.
+/// Build the HTTP service from dispatch and bootstrap config.
+fn build_service(
+    runtime: &WorkerRuntime,
+    bootstrap: &WorkerBootstrap,
+    dispatch: Arc<dyn crate::dispatch::Dispatch>,
+) -> ApxService {
     let mut config = ServiceConfig {
         timeout: Duration::from_secs(bootstrap.request_timeout_secs),
         ..ServiceConfig::default()
@@ -202,12 +227,17 @@ pub async fn run_worker(
         config.max_concurrent = mc;
     }
     let server_addr = runtime.listener.local_addr();
-    let service = ApxService::new(dispatch, server_addr, &config);
+    ApxService::new(dispatch, server_addr, &config)
+}
 
-    // Split IPC channel for concurrent read/write.
+/// Accept connections and serve until shutdown or drain.
+async fn serve(
+    runtime: WorkerRuntime,
+    service: ApxService,
+    drain_timeout_secs: u64,
+) -> Result<(), WorkerError> {
     let (ipc_reader, mut ipc_writer) = runtime.channel.split();
 
-    // Spawn drain listener — waits for supervisor's Drain command.
     let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let mut reader = ipc_reader;
@@ -232,7 +262,6 @@ pub async fn run_worker(
         }
     });
 
-    // Combined shutdown: OS signal OR IPC drain.
     let combined_shutdown = async {
         tokio::select! {
             () = shutdown_signal() => {}
@@ -244,22 +273,61 @@ pub async fn run_worker(
         .await
         .map_err(WorkerError::Serve)?;
 
-    // Drain in-flight connections (bounded by request timeout).
-    let drain_timeout =
-        Duration::from_secs(bootstrap.request_timeout_secs.max(MIN_DRAIN_TIMEOUT_SECS));
-    let _ = tokio::time::timeout(drain_timeout, async {
-        while connections.join_next().await.is_some() {}
-    })
-    .await;
+    if drain_timeout_secs > 0 {
+        let _ = tokio::time::timeout(Duration::from_secs(drain_timeout_secs), async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await;
+    }
 
-    // Best-effort: tell supervisor we're done draining.
     let _ = ipc_writer.send(&IpcMessage::Drained).await;
 
-    // Flush pending OTLP spans, metrics, and logs before the event loop stops.
     apx_core::tracing_init::shutdown_telemetry();
     runtime.event_loop.shutdown();
 
     Ok(())
+}
+
+/// Connect, init, load app, signal readiness, and serve.
+///
+/// If app loading fails, sends `StartupFailed` over IPC so the supervisor
+/// receives the error message instead of waiting for a readiness timeout.
+///
+/// # Errors
+///
+/// Returns an error at any step in the worker lifecycle.
+pub async fn run_worker(
+    channel: WorkerChannel,
+    bootstrap: WorkerBootstrap,
+) -> Result<(), WorkerError> {
+    let mut runtime = init_worker(&bootstrap, channel).await?;
+
+    let ready = match load_app(&runtime, &bootstrap) {
+        Ok(ready) => ready,
+        Err(e) => {
+            let detail = format_worker_error(&e);
+            let _ = runtime
+                .channel
+                .send(&IpcMessage::StartupFailed { error: detail })
+                .await;
+            return Err(e);
+        }
+    };
+
+    signal_readiness(&mut runtime.channel).await?;
+    relay_telemetry(&mut runtime.channel, &bootstrap, &ready.telemetry).await?;
+    init_metrics(&ready.telemetry);
+
+    let _process_metrics_handle = if ready.telemetry.process.enabled {
+        Some(crate::telemetry::process_metrics::spawn_process_metrics(
+            &ready.telemetry.process,
+        ))
+    } else {
+        None
+    };
+
+    let service = build_service(&runtime, &bootstrap, ready.dispatch);
+    serve(runtime, service, bootstrap.drain_timeout_secs).await
 }
 
 /// Detect worker mode and connect to the supervisor's IPC channel.
@@ -301,6 +369,40 @@ pub async fn connect_to_supervisor()
     }
 
     Ok(Some((channel, bootstrap)))
+}
+
+// ── Python logging config ───────────────────────────────────────────────
+
+/// Apply the customer's Python logging config when `APX_PYTHON_LOG_CONFIG`
+/// is set (dev mode only).  Supports JSON (`logging.config.dictConfig`) and
+/// Python (`logging.config.fileConfig`) config files.
+fn apply_python_log_config() -> Result<(), WorkerError> {
+    let config_path = match std::env::var("APX_PYTHON_LOG_CONFIG") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return Ok(()),
+    };
+
+    Python::attach(|py| {
+        let locals = pyo3::types::PyDict::new(py);
+        locals.set_item("_path", &config_path)?;
+
+        let path = std::path::Path::new(&config_path);
+        if path.extension().is_some_and(|ext| ext == "py") {
+            py.run(
+                c"import logging.config; logging.config.fileConfig(_path)",
+                None,
+                Some(&locals),
+            )?;
+        } else {
+            py.run(
+                c"import json, logging.config, pathlib; logging.config.dictConfig(json.loads(pathlib.Path(_path).read_text()))",
+                None,
+                Some(&locals),
+            )?;
+        }
+        Ok(())
+    })
+    .map_err(|e: PyErr| WorkerError::PythonInit(format!("log config: {e}")))
 }
 
 // ── launch wrapper ──────────────────────────────────────────────────────
@@ -518,6 +620,45 @@ _el2.close()
                 send_errors.is_empty(),
                 "CancelledError must not be forwarded to send_error: {send_errors:?}"
             );
+        });
+    }
+
+    // SAFETY: these env-var tests are single-threaded (#[test] with no async
+    // or parallel spawns), so set_var / remove_var cannot race.
+    #[expect(unsafe_code, reason = "env-var manipulation in single-threaded test")]
+    #[test]
+    fn apply_log_config_noop_when_unset() {
+        unsafe { std::env::remove_var("APX_PYTHON_LOG_CONFIG") };
+        apply_python_log_config().expect("noop when env var absent");
+    }
+
+    #[expect(unsafe_code, reason = "env-var manipulation in single-threaded test")]
+    #[test]
+    fn apply_log_config_noop_when_empty() {
+        unsafe { std::env::set_var("APX_PYTHON_LOG_CONFIG", "") };
+        let result = apply_python_log_config();
+        unsafe { std::env::remove_var("APX_PYTHON_LOG_CONFIG") };
+        result.expect("noop when env var empty");
+    }
+
+    #[expect(unsafe_code, reason = "env-var manipulation in single-threaded test")]
+    #[test]
+    fn apply_log_config_json() {
+        crate::with_py(|_py| {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let config_path = dir.path().join("logging.json");
+            std::fs::write(
+                &config_path,
+                r#"{"version": 1, "disable_existing_loggers": false, "handlers": {}, "loggers": {}}"#,
+            )
+            .expect("write config");
+
+            unsafe {
+                std::env::set_var("APX_PYTHON_LOG_CONFIG", config_path.to_str().expect("utf8"));
+            }
+            let result = apply_python_log_config();
+            unsafe { std::env::remove_var("APX_PYTHON_LOG_CONFIG") };
+            result.expect("dictConfig should succeed");
         });
     }
 }

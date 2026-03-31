@@ -16,7 +16,13 @@ use tracing::{debug, info, warn};
 use apx_databricks_sdk::DatabricksClient;
 
 use crate::api_generator::start_openapi_watcher;
-use crate::dev::common::{Shutdown, lock_path, remove_lock};
+use crate::dev::common::{ProcessStatus, ServerHealth, Shutdown, lock_path, remove_lock};
+
+/// Maximum time to wait for all services to become healthy during startup.
+const STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Polling interval for the startup health check loop.
+const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(500);
 use crate::dev::logging::BrowserLogPayload;
 use crate::dev::otel::build_otlp_log_payload_from_ms;
 use crate::dev::process::ProcessManager;
@@ -39,10 +45,10 @@ struct AppState {
 
 #[derive(serde::Serialize)]
 struct HealthResponse {
-    status: &'static str,
-    frontend_status: String,
-    backend_status: String,
-    db_status: String,
+    status: ServerHealth,
+    frontend_status: ProcessStatus,
+    backend_status: ProcessStatus,
+    db_status: ProcessStatus,
     /// True if any critical process (frontend/backend) has permanently failed and cannot recover
     failed: bool,
 }
@@ -54,7 +60,7 @@ pub struct ServerConfig {
     pub app_dir: PathBuf,
     /// Pre-bound TCP listener for the main server port.
     pub listener: tokio::net::TcpListener,
-    /// Port assigned to the backend (uvicorn) subprocess.
+    /// Port assigned to the backend subprocess.
     pub backend_port: u16,
     /// Port assigned to the frontend subprocess, if the project has a UI.
     pub frontend_port: Option<u16>,
@@ -157,7 +163,40 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     process_manager.start_processes();
     debug!("Process spawning started in background");
 
-    // Start .env watcher — restarts uvicorn when environment variables change
+    // Print the user-facing URL once all critical services are healthy.
+    {
+        let pm = Arc::clone(&process_manager);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let startup_deadline = tokio::time::Instant::now() + STARTUP_HEALTH_TIMEOUT;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    () = tokio::time::sleep_until(startup_deadline) => {
+                        warn!(
+                            name: "apx.dev.startup_timeout",
+                            "startup health loop timed out after {}s, services may not be fully healthy",
+                            STARTUP_HEALTH_TIMEOUT.as_secs(),
+                        );
+                        break;
+                    }
+                    () = tokio::time::sleep(STARTUP_POLL_INTERVAL) => {
+                        let (fe, be, _db) = pm.status().await;
+                        if fe.is_ready() && be.is_ready() {
+                            info!(
+                                "server is available at http://{}:{}",
+                                apx_common::hosts::BROWSER_HOST,
+                                port,
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Start .env watcher — restarts backend when environment variables change
     spawn_polling_watcher(
         EnvWatcher::new(Arc::clone(&process_manager), app_dir.join(".env")),
         shutdown_tx.subscribe(),
@@ -254,7 +293,7 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Watches the `.env` file for changes and restarts uvicorn when environment
+/// Watches the `.env` file for changes and restarts the backend when environment
 /// variables are added, removed, or modified.
 ///
 /// On the first poll the current variables are recorded as the baseline.
@@ -296,13 +335,13 @@ impl PollingWatcher for EnvWatcher {
             }
         };
         if self.has_loaded && current_vars != self.last_vars {
-            info!(".env changed, restarting uvicorn");
+            info!(".env changed, restarting backend");
             if let Err(err) = self
                 .process_manager
-                .restart_uvicorn_with_env(current_vars.clone())
+                .restart_backend_with_env(current_vars.clone())
                 .await
             {
-                warn!("Failed to restart uvicorn: {err}");
+                warn!("Failed to restart backend: {err}");
             }
         }
         self.last_vars = current_vars;
@@ -366,25 +405,16 @@ async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRespon
     let probe_start = std::time::Instant::now();
     let (frontend_status, backend_status, db_status) = state.process_manager.status().await;
     let probe_elapsed_ms = probe_start.elapsed().as_millis();
-    let has_ui = state.process_manager.has_ui();
 
-    // Check if any critical process has permanently failed (crashed/exited)
-    let failed = if has_ui {
-        frontend_status == "failed" || backend_status == "failed"
+    let failed = frontend_status.is_failed() || backend_status.is_failed();
+    let status = if frontend_status.is_ready() && backend_status.is_ready() {
+        ServerHealth::Ok
     } else {
-        backend_status == "failed"
+        ServerHealth::Starting
     };
-
-    // DB is non-critical - only critical services must be healthy for "ok" status
-    let all_healthy = if has_ui {
-        frontend_status == "healthy" && backend_status == "healthy"
-    } else {
-        backend_status == "healthy"
-    };
-    let status = if all_healthy { "ok" } else { "starting" };
 
     debug!(
-        status,
+        %status,
         frontend = %frontend_status,
         backend = %backend_status,
         db = %db_status,

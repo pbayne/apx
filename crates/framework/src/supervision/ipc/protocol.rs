@@ -195,6 +195,12 @@ pub enum IpcMessage {
     /// Worker → Supervisor: telemetry config read from Python for supervisor relay.
     TelemetryConfig(TelemetryRelay),
 
+    /// Worker → Supervisor: startup failed with error details.
+    StartupFailed {
+        /// Human-readable error message from the failed startup step.
+        error: String,
+    },
+
     /// Supervisor → Worker: stop accepting, finish in-flight requests.
     Drain,
 
@@ -242,6 +248,18 @@ pub struct WorkerBootstrap {
     /// If true, the worker sends a `TelemetryConfig` message after app load.
     #[serde(default)]
     pub relay_telemetry: bool,
+    /// Maximum seconds the worker should spend draining in-flight connections
+    /// before giving up and exiting. Must be less than the supervisor's drain
+    /// timeout so the worker can send `Drained` before being killed.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+    /// Enable dev-mode error visibility (tracebacks in 500 response bodies).
+    #[serde(default)]
+    pub dev_mode: bool,
+}
+
+fn default_drain_timeout_secs() -> u64 {
+    5
 }
 
 // ── Bootstrap errors ────────────────────────────────────────────────────
@@ -327,6 +345,8 @@ mod tests {
             nonce: Nonce::generate(),
             loop_policy: "uvloop".to_owned(),
             relay_telemetry: false,
+            drain_timeout_secs: 5,
+            dev_mode: false,
         };
         let msg = IpcMessage::Bootstrap(bootstrap);
         let encoded = rmp_serde::to_vec(&msg)
@@ -370,6 +390,48 @@ mod tests {
         let decoded: IpcMessage = rmp_serde::from_slice(&encoded)
             .unwrap_or_else(|e| unreachable!("Drained should be deserializable: {e}"));
         assert!(matches!(decoded, IpcMessage::Drained));
+    }
+
+    #[test]
+    fn ipc_message_startup_failed_roundtrip() {
+        let msg = IpcMessage::StartupFailed {
+            error: "app load failed: no attribute 'app' in module 'main'".to_owned(),
+        };
+        let encoded = rmp_serde::to_vec(&msg)
+            .unwrap_or_else(|e| unreachable!("StartupFailed should be serializable: {e}"));
+        let decoded: IpcMessage = rmp_serde::from_slice(&encoded)
+            .unwrap_or_else(|e| unreachable!("StartupFailed should be deserializable: {e}"));
+        match decoded {
+            IpcMessage::StartupFailed { error } => {
+                assert!(error.contains("no attribute"));
+            }
+            other => unreachable!("expected StartupFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipc_message_startup_failed_multiline_traceback_roundtrip() {
+        let traceback = "\
+Traceback (most recent call last):
+  File \"/app/router.py\", line 11, in <module>
+    x = undefined_var
+NameError: name 'undefined_var' is not defined
+";
+        let msg = IpcMessage::StartupFailed {
+            error: traceback.to_owned(),
+        };
+        let encoded = rmp_serde::to_vec(&msg)
+            .unwrap_or_else(|e| unreachable!("StartupFailed should be serializable: {e}"));
+        let decoded: IpcMessage = rmp_serde::from_slice(&encoded)
+            .unwrap_or_else(|e| unreachable!("StartupFailed should be deserializable: {e}"));
+        match decoded {
+            IpcMessage::StartupFailed { error } => {
+                assert!(error.contains("Traceback"));
+                assert!(error.contains("NameError"));
+                assert!(error.contains("router.py"));
+            }
+            other => unreachable!("expected StartupFailed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -442,6 +504,8 @@ mod tests {
             nonce: Nonce::from_string("abc123".to_owned()),
             loop_policy: "uvloop".to_owned(),
             relay_telemetry: false,
+            drain_timeout_secs: 5,
+            dev_mode: false,
         };
         let encoded = rmp_serde::to_vec(&bootstrap).unwrap();
         let decoded: WorkerBootstrap = rmp_serde::from_slice(&encoded).unwrap();
@@ -459,6 +523,8 @@ mod tests {
             nonce: Nonce::from_string("abc123".to_owned()),
             loop_policy: default_loop_policy(),
             relay_telemetry: false,
+            drain_timeout_secs: 5,
+            dev_mode: false,
         };
         assert_eq!(bootstrap.loop_policy, "uvloop");
     }
@@ -474,6 +540,8 @@ mod tests {
             nonce: Nonce::from_string("abc123".to_owned()),
             loop_policy: "uvloop".to_owned(),
             relay_telemetry: true,
+            drain_timeout_secs: 5,
+            dev_mode: false,
         };
         let encoded = rmp_serde::to_vec(&bootstrap).unwrap();
         let decoded: WorkerBootstrap = rmp_serde::from_slice(&encoded).unwrap();
